@@ -1,0 +1,18 @@
+rules_version = '2';
+
+// Paste this into Firebase Console → Firestore Database → Rules, replacing what's there.
+//
+// What this does:
+// - Anyone can READ the items collection — this is what lets staff view stock with
+//   no login at all.
+// - Only a signed-in user (you, the manager) can WRITE — add, edit, delete, adjust
+//   stock. Staff without a login are blocked from making changes even if they tried
+//   to call the database directly (not just blocked by the app's UI).
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /items/{itemId} {
+      allow read: if true;
+      allow write: if request.auth != null;
+    }
+  }
+}
