@@ -117,6 +117,8 @@
 
   <div id="managerActions" class="actions-row sans hidden">
     <button id="btnAdd" class="btn btn-primary">+ Add item</button>
+    <button id="btnImportExcel" class="btn">📄 Import Excel</button>
+    <input id="importExcelInput" type="file" accept=".xlsx,.xls" hidden />
     <button id="btnExportJson" class="btn">⬇ Backup (JSON)</button>
     <button id="btnPrintTags" class="btn">🏷 Print QR tags</button>
     <button id="btnSignOut" class="btn" style="margin-left:auto;">🔒 Sign out</button>
@@ -182,6 +184,21 @@
   </div>
 </div>
 
+<div id="importModal" class="modal-overlay hidden">
+  <div class="modal sans">
+    <div class="modal-head">
+      <div class="modal-title">Import from Excel</div>
+      <button id="btnCloseImport" class="close-x">✕</button>
+    </div>
+    <div id="importSummary" style="font-size:13.5px;line-height:1.5;color:var(--ink);"></div>
+    <div id="importError" class="field-error"></div>
+    <div style="display:flex;gap:8px;margin-top:16px;">
+      <button id="btnConfirmImport" class="btn btn-primary" style="flex:1;justify-content:center;">Import</button>
+      <button id="btnCancelImport" class="btn" style="flex:1;justify-content:center;">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div id="formModal" class="modal-overlay hidden">
   <div class="modal sans">
     <div class="modal-head">
@@ -215,6 +232,7 @@
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <script type="module" src="app.js"></script>
 </body>
 </html>

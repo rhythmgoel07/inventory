@@ -6,7 +6,7 @@ import { firebaseConfig } from "./firebase-config.js";
 import { initializeApp } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-app.js";
 import {
   getFirestore, collection, doc, onSnapshot, setDoc, deleteDoc,
-  enableIndexedDbPersistence,
+  enableIndexedDbPersistence, writeBatch,
 } from "https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore.js";
 import {
   getAuth, signInWithEmailAndPassword, onAuthStateChanged, signOut,
@@ -528,9 +528,215 @@ async function submitForm() {
 }
 
 // ============================================================================
-// JSON backup (safety net — a copy of your data independent of Firebase, in
-// case you ever need to restore or migrate. Full fidelity, includes photos.)
+// Excel import. Reads an .xlsx (including embedded photos), shows a confirmation
+// preview, then MERGES into Firestore — existing SKUs are updated, new ones added,
+// and anything already in the database that's NOT in the file is left untouched.
+// It never wipes the collection, so a stray import can't destroy everyone's data.
 // ============================================================================
+let pendingImport = null; // holds parsed items awaiting confirmation
+
+function resolveZipPath(baseDir, relTarget) {
+  if (relTarget.startsWith("/")) return relTarget.replace(/^\//, "");
+  const stack = baseDir ? baseDir.split("/") : [];
+  relTarget.split("/").forEach((p) => {
+    if (p === "..") stack.pop();
+    else if (p === "." || p === "") { /* skip */ }
+    else stack.push(p);
+  });
+  return stack.join("/");
+}
+function bytesToBase64(bytes) {
+  let binary = "";
+  const chunk = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunk) binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunk));
+  return btoa(binary);
+}
+function extractImagesFromWorkbook(wb, sheetName) {
+  const result = new Map();
+  try {
+    const files = wb.files;
+    if (!files) return result;
+    const getText = (path) => {
+      const f = files[path];
+      if (!f || f.content == null) return null;
+      return typeof f.content === "string" ? f.content : new TextDecoder("utf-8").decode(f.content);
+    };
+    const getBytes = (path) => {
+      const f = files[path];
+      if (!f || f.content == null) return null;
+      if (typeof f.content === "string") return new TextEncoder().encode(f.content);
+      return f.content instanceof Uint8Array ? f.content : new Uint8Array(f.content);
+    };
+    const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const workbookXml = getText("xl/workbook.xml");
+    if (!workbookXml) return result;
+    let sheetM = workbookXml.match(new RegExp(`<sheet[^>]*name="${escRe(sheetName)}"[^>]*r:id="(rId\\d+)"`));
+    if (!sheetM) sheetM = workbookXml.match(new RegExp(`<sheet[^>]*r:id="(rId\\d+)"[^>]*name="${escRe(sheetName)}"`));
+    if (!sheetM) return result;
+    const wbRels = getText("xl/_rels/workbook.xml.rels");
+    if (!wbRels) return result;
+    const relM = wbRels.match(new RegExp(`Id="${sheetM[1]}"[^>]*Target="([^"]+)"`));
+    if (!relM) return result;
+    let sheetPath = relM[1].replace(/^\//, "");
+    if (!sheetPath.startsWith("xl/")) sheetPath = "xl/" + sheetPath;
+    const sheetDir = sheetPath.substring(0, sheetPath.lastIndexOf("/"));
+    const sheetFile = sheetPath.substring(sheetPath.lastIndexOf("/") + 1);
+    const sheetRels = getText(`${sheetDir}/_rels/${sheetFile}.rels`);
+    if (!sheetRels) return result;
+    const drawRelM = sheetRels.match(/Id="(rId\d+)"[^>]*Target="([^"]*drawing[^"]*)"/i);
+    if (!drawRelM) return result;
+    const drawingPath = resolveZipPath(sheetDir, drawRelM[2]);
+    const drawingXml = getText(drawingPath);
+    if (!drawingXml) return result;
+    const anchorBlocks = drawingXml.match(/<xdr:twoCellAnchor[\s\S]*?<\/xdr:twoCellAnchor>/g) || [];
+    const rowToRid = [];
+    anchorBlocks.forEach((block) => {
+      const rowM = block.match(/<xdr:from>\s*<xdr:col>\d+<\/xdr:col>\s*<xdr:colOff>\d+<\/xdr:colOff>\s*<xdr:row>(\d+)<\/xdr:row>/);
+      const ridM = block.match(/r:embed="(rId\d+)"/);
+      if (rowM && ridM) rowToRid.push({ row: parseInt(rowM[1], 10), rid: ridM[1] });
+    });
+    if (rowToRid.length === 0) return result;
+    const drawingDir = drawingPath.substring(0, drawingPath.lastIndexOf("/"));
+    const drawingFile = drawingPath.substring(drawingPath.lastIndexOf("/") + 1);
+    const drawingRels = getText(`${drawingDir}/_rels/${drawingFile}.rels`);
+    if (!drawingRels) return result;
+    const ridToMedia = {};
+    Array.from(drawingRels.matchAll(/Id="(rId\d+)"[^>]*Target="([^"]+)"/g)).forEach((rm) => {
+      ridToMedia[rm[1]] = resolveZipPath(drawingDir, rm[2]);
+    });
+    rowToRid.forEach(({ row, rid }) => {
+      const mediaPath = ridToMedia[rid];
+      if (!mediaPath) return;
+      const bytes = getBytes(mediaPath);
+      if (!bytes) return;
+      const ext = mediaPath.split(".").pop().toLowerCase();
+      const mime = ext === "jpg" || ext === "jpeg" ? "image/jpeg" : ext === "gif" ? "image/gif" : "image/png";
+      result.set(row, `data:${mime};base64,${bytesToBase64(bytes)}`);
+    });
+  } catch (e) { console.error("Image extraction failed:", e); }
+  return result;
+}
+function computeAvgRgbFromDataUrl(dataUrl) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const c = document.getElementById("hiddenCanvasSmall");
+      c.width = 24; c.height = 24;
+      const ctx = c.getContext("2d");
+      ctx.drawImage(img, 0, 0, 24, 24);
+      const data = ctx.getImageData(0, 0, 24, 24).data;
+      let r = 0, g = 0, b = 0, n = 0;
+      for (let i = 0; i < data.length; i += 4) { r += data[i]; g += data[i + 1]; b += data[i + 2]; n++; }
+      resolve([Math.round(r / n), Math.round(g / n), Math.round(b / n)]);
+    };
+    img.onerror = () => resolve(null);
+    img.src = dataUrl;
+  });
+}
+
+async function handleExcelImport(file) {
+  if (!file) return;
+  const errEl = document.getElementById("importError");
+  errEl.style.display = "none";
+  try {
+    const buf = await file.arrayBuffer();
+    const wb = XLSX.read(buf, { type: "array", bookFiles: true });
+    const sheetName = wb.SheetNames.includes("Inventory") ? "Inventory" : wb.SheetNames[0];
+    const ws = wb.Sheets[sheetName];
+    const aoa = XLSX.utils.sheet_to_json(ws, { header: 1 });
+    const headerIdx = aoa.findIndex((r) => r && r[0] === "SKU");
+    if (headerIdx === -1) {
+      showImportModal("Couldn't find a SKU column in that file. Make sure you're using the inventory workbook with a header row that starts with 'SKU'.", true);
+      return;
+    }
+    const headers = aoa[headerIdx];
+    const col = (name) => headers.indexOf(name);
+    const imageMap = extractImagesFromWorkbook(wb, sheetName);
+
+    const rows = [];
+    aoa.forEach((r, idx) => {
+      if (idx <= headerIdx) return;
+      if (r && r[0] && r[0] !== "TOTALS") rows.push({ r, aoaIndex: idx });
+    });
+    const rowIndexSet = new Set(rows.map((x) => x.aoaIndex));
+    const resolvedImageMap = new Map();
+    imageMap.forEach((dataUrl, anchorRow) => {
+      if (rowIndexSet.has(anchorRow)) { resolvedImageMap.set(anchorRow, dataUrl); return; }
+      for (const delta of [1, -1, 2, -2]) {
+        if (rowIndexSet.has(anchorRow + delta)) { resolvedImageMap.set(anchorRow + delta, dataUrl); return; }
+      }
+    });
+
+    const parsed = await Promise.all(rows.map(async ({ r, aoaIndex }) => {
+      const category = String(r[col("Category")] || "Other");
+      const image = resolvedImageMap.get(aoaIndex) || null;
+      const avgRgb = image ? (await computeAvgRgbFromDataUrl(image)) : null;
+      return {
+        id: String(r[col("SKU")]), sku: String(r[col("SKU")]), name: String(r[col("Item Name")] || ""),
+        category, material: String(r[col("Material")] || ""), supplier: String(r[col("Supplier")] || ""),
+        warehouse: String(r[col("Warehouse/Location")] || ""),
+        cost: Number(r[col("Cost Price")]) || 0, price: Number(r[col("Selling Price")]) || 0,
+        stock: Number(r[col("Stock Qty")]) || 0, reorder: Number(r[col("Reorder Level")]) || 0,
+        image, avgRgb: avgRgb || mixColor(colorFor(category), "#FFFFFF", 0.55),
+      };
+    }));
+
+    if (parsed.length === 0) { showImportModal("No item rows found in that file.", true); return; }
+
+    pendingImport = parsed;
+    const existingIds = new Set(ITEMS.map((it) => it.id));
+    const updating = parsed.filter((it) => existingIds.has(it.id)).length;
+    const adding = parsed.length - updating;
+    const withPhotos = parsed.filter((it) => it.image).length;
+    showImportModal(
+      `<b>${parsed.length}</b> items found in the file (${withPhotos} with photos).<br><br>` +
+      `• <b>${adding}</b> new item${adding === 1 ? "" : "s"} will be added<br>` +
+      `• <b>${updating}</b> existing item${updating === 1 ? "" : "s"} (same SKU) will be updated<br><br>` +
+      `Nothing else in your inventory is touched — items already in the app but not in this file stay as they are.`,
+      false
+    );
+  } catch (e) {
+    console.error(e);
+    showImportModal("Couldn't read that file — check it's a valid .xlsx spreadsheet.", true);
+  }
+}
+
+function showImportModal(html, isError) {
+  document.getElementById("importSummary").innerHTML = isError ? "" : html;
+  const errEl = document.getElementById("importError");
+  if (isError) { errEl.textContent = html.replace(/<[^>]+>/g, ""); errEl.style.display = "block"; }
+  else errEl.style.display = "none";
+  document.getElementById("btnConfirmImport").style.display = isError ? "none" : "";
+  document.getElementById("importModal").classList.remove("hidden");
+}
+function closeImportModal() {
+  document.getElementById("importModal").classList.add("hidden");
+  pendingImport = null;
+  document.getElementById("importExcelInput").value = "";
+}
+
+async function confirmImport() {
+  if (!pendingImport) return;
+  const btn = document.getElementById("btnConfirmImport");
+  btn.textContent = "Importing…"; btn.disabled = true;
+  try {
+    // Firestore batches cap at 500 writes each, so chunk to be safe.
+    for (let i = 0; i < pendingImport.length; i += 400) {
+      const batch = writeBatch(db);
+      pendingImport.slice(i, i + 400).forEach((it) => batch.set(itemDocRef(it.id), it));
+      await batch.commit();
+    }
+    toast(`Imported ${pendingImport.length} items`);
+    closeImportModal();
+  } catch (e) {
+    console.error(e);
+    toast(e.code === "permission-denied" ? "Sign in required to import" : "Import failed — check your connection");
+  } finally {
+    btn.textContent = "Import"; btn.disabled = false;
+  }
+}
+
+
 function todayStamp() { return new Date().toISOString().slice(0, 10); }
 function handleJsonExport() {
   const blob = new Blob([JSON.stringify(ITEMS, null, 2)], { type: "application/json" });
@@ -642,6 +848,13 @@ formImgRef.onchange = async (e) => {
 
 document.getElementById("btnExportJson").onclick = handleJsonExport;
 document.getElementById("btnPrintTags").onclick = printQRTags;
+
+document.getElementById("btnImportExcel").onclick = () => document.getElementById("importExcelInput").click();
+document.getElementById("importExcelInput").onchange = (e) => handleExcelImport(e.target.files[0]);
+document.getElementById("btnCloseImport").onclick = closeImportModal;
+document.getElementById("btnCancelImport").onclick = closeImportModal;
+document.getElementById("btnConfirmImport").onclick = confirmImport;
+document.getElementById("importModal").onclick = (e) => { if (e.target.id === "importModal") closeImportModal(); };
 
 const dropzone = document.getElementById("dropzone");
 dropzone.onclick = () => document.getElementById("photoSearchInput").click();

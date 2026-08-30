@@ -1,5 +1,5 @@
 // Bump this version any time you change a cached file, so phones pick up updates.
-const CACHE_VERSION = "furniture-inventory-firebase-v1";
+const CACHE_VERSION = "furniture-inventory-firebase-v2";
 
 // This caches the app SHELL only (so it opens instantly, and the interface still
 // shows even with no connection) — NOT the live inventory data. The data itself
@@ -17,6 +17,7 @@ const PRECACHE_URLS = [
   "./icons/icon-maskable-512.png",
   "https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js",
   "https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js",
+  "https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js",
 ];
 
 self.addEventListener("install", (event) => {
