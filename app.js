@@ -634,6 +634,26 @@ function computeAvgRgbFromDataUrl(dataUrl) {
   });
 }
 
+// Excel embeds photos at full resolution, which can be several MB each — far over
+// Firestore's ~1MB-per-field limit. Shrink every imported photo to the same small
+// size the in-app camera uses (~160px, JPEG) so it fits comfortably and stays fast.
+function shrinkDataUrl(dataUrl, maxDim = 160, quality = 0.6) {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      let w = img.width, h = img.height;
+      if (w > h) { if (w > maxDim) { h = Math.round((h * maxDim) / w); w = maxDim; } }
+      else if (h > maxDim) { w = Math.round((w * maxDim) / h); h = maxDim; }
+      const canvas = document.getElementById("hiddenCanvas");
+      canvas.width = w; canvas.height = h;
+      canvas.getContext("2d").drawImage(img, 0, 0, w, h);
+      resolve(canvas.toDataURL("image/jpeg", quality));
+    };
+    img.onerror = () => resolve(null); // if it can't be read, drop the photo rather than fail the import
+    img.src = dataUrl;
+  });
+}
+
 async function handleExcelImport(file) {
   if (!file) return;
   const errEl = document.getElementById("importError");
@@ -669,7 +689,8 @@ async function handleExcelImport(file) {
 
     const parsed = await Promise.all(rows.map(async ({ r, aoaIndex }) => {
       const category = String(r[col("Category")] || "Other");
-      const image = resolvedImageMap.get(aoaIndex) || null;
+      const rawImage = resolvedImageMap.get(aoaIndex) || null;
+      const image = rawImage ? await shrinkDataUrl(rawImage) : null;
       const avgRgb = image ? (await computeAvgRgbFromDataUrl(image)) : null;
       return {
         id: String(r[col("SKU")]), sku: String(r[col("SKU")]), name: String(r[col("Item Name")] || ""),
@@ -720,13 +741,22 @@ async function confirmImport() {
   const btn = document.getElementById("btnConfirmImport");
   btn.textContent = "Importing…"; btn.disabled = true;
   try {
-    // Firestore batches cap at 500 writes each, so chunk to be safe.
+    // Final safety guard: if any single image is still over ~0.9MB (Firestore's hard
+    // limit is ~1MB per field), drop just that photo rather than let it fail the whole
+    // import. The item itself still imports, just without its picture.
+    let droppedPhotos = 0;
+    pendingImport.forEach((it) => {
+      if (it.image && it.image.length > 900000) { it.image = null; droppedPhotos++; }
+    });
+
     for (let i = 0; i < pendingImport.length; i += 400) {
       const batch = writeBatch(db);
       pendingImport.slice(i, i + 400).forEach((it) => batch.set(itemDocRef(it.id), it));
       await batch.commit();
     }
-    toast(`Imported ${pendingImport.length} items`);
+    toast(droppedPhotos
+      ? `Imported ${pendingImport.length} items (${droppedPhotos} photo${droppedPhotos === 1 ? "" : "s"} too large, skipped)`
+      : `Imported ${pendingImport.length} items`);
     closeImportModal();
   } catch (e) {
     console.error(e);
