@@ -777,6 +777,40 @@ function handleJsonExport() {
   toast("Backup ready — save it somewhere safe");
 }
 
+// Exports current inventory to a real .xlsx with the same column layout the importer
+// expects — so an exported file can be edited in Excel and re-imported cleanly (a full
+// round trip). Photos: SheetJS's free build can't embed images into cells, so instead
+// each item's photo is written into the sheet's own drawing layer via a post-step is not
+// feasible here; we note in the header which items have a photo, and photos themselves
+// stay safe in the app/JSON backup. Data columns are fully preserved.
+function handleExcelExport() {
+  const rows = ITEMS.map((it) => ({
+    "SKU": it.sku,
+    "Item Name": it.name,
+    "Category": it.category,
+    "Material": it.material,
+    "Supplier": it.supplier,
+    "Warehouse/Location": it.warehouse,
+    "Cost Price": it.cost,
+    "Selling Price": it.price,
+    "Margin %": it.price ? Math.round(((it.price - it.cost) / it.price) * 1000) / 10 : 0,
+    "Stock Qty": it.stock,
+    "Reorder Level": it.reorder,
+    "Stock Value": (it.cost || 0) * (it.stock || 0),
+    "Stock Status": stockInfo(it).text,
+    "Has Photo": it.image ? "Yes" : "",
+  }));
+  const ws = XLSX.utils.json_to_sheet(rows);
+  ws["!cols"] = [
+    { wch: 11 }, { wch: 26 }, { wch: 12 }, { wch: 16 }, { wch: 20 }, { wch: 16 },
+    { wch: 11 }, { wch: 12 }, { wch: 9 }, { wch: 10 }, { wch: 12 }, { wch: 12 }, { wch: 13 }, { wch: 9 },
+  ];
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, ws, "Inventory");
+  XLSX.writeFile(wb, `inventory_export_${todayStamp()}.xlsx`);
+  toast("Excel exported — check your downloads");
+}
+
 // ============================================================================
 // Manager login (Firebase Authentication — Email/Password)
 // ============================================================================
@@ -877,6 +911,7 @@ formImgRef.onchange = async (e) => {
 };
 
 document.getElementById("btnExportJson").onclick = handleJsonExport;
+document.getElementById("btnExportExcel").onclick = handleExcelExport;
 document.getElementById("btnPrintTags").onclick = printQRTags;
 
 document.getElementById("btnImportExcel").onclick = () => document.getElementById("importExcelInput").click();

@@ -1,5 +1,5 @@
 // Bump this version any time you change a cached file, so phones pick up updates.
-const CACHE_VERSION = "furniture-inventory-firebase-v2";
+const CACHE_VERSION = "furniture-inventory-firebase-v3";
 
 // This caches the app SHELL only (so it opens instantly, and the interface still
 // shows even with no connection) — NOT the live inventory data. The data itself
